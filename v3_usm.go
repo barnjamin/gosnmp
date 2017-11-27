@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"sync"
 	"sync/atomic"
 )
 
@@ -57,13 +58,17 @@ type UsmSecurityParameters struct {
 	AuthenticationPassphrase string
 	PrivacyPassphrase        string
 
-	secretKey []byte
+	secretKey  []byte
 	privacyKey []byte
 
 	localDESSalt uint32
 	localAESSalt uint64
 
 	Logger Logger
+}
+
+func (sp *UsmSecurityParameters) Log() {
+	sp.Logger.Printf("SECURITY PARAMETERS:%+v", sp)
 }
 
 // Copy method for UsmSecurityParameters used to copy a SnmpV3SecurityParameters without knowing it's implementation
@@ -78,8 +83,8 @@ func (sp *UsmSecurityParameters) Copy() SnmpV3SecurityParameters {
 		PrivacyProtocol:          sp.PrivacyProtocol,
 		AuthenticationPassphrase: sp.AuthenticationPassphrase,
 		PrivacyPassphrase:        sp.PrivacyPassphrase,
-		secretKey:		  sp.secretKey,
-		privacyKey:		  sp.privacyKey,
+		secretKey:                sp.secretKey,
+		privacyKey:               sp.privacyKey,
 		localDESSalt:             sp.localDESSalt,
 		localAESSalt:             sp.localAESSalt,
 		Logger:                   sp.Logger,
@@ -126,16 +131,10 @@ func (sp *UsmSecurityParameters) validate(flags SnmpV3MsgFlags) error {
 		if sp.PrivacyProtocol <= NoPriv {
 			return fmt.Errorf("SecurityParameters.PrivacyProtocol is required")
 		}
-		if sp.PrivacyPassphrase == "" {
-			return fmt.Errorf("SecurityParameters.PrivacyPassphrase is required")
-		}
 		fallthrough
 	case AuthNoPriv:
 		if sp.AuthenticationProtocol <= NoAuth {
 			return fmt.Errorf("SecurityParameters.AuthenticationProtocol is required")
-		}
-		if sp.AuthenticationPassphrase == "" {
-			return fmt.Errorf("SecurityParameters.AuthenticationPassphrase is required")
 		}
 		fallthrough
 	case NoAuthNoPriv:
@@ -144,6 +143,18 @@ func (sp *UsmSecurityParameters) validate(flags SnmpV3MsgFlags) error {
 		}
 	default:
 		return fmt.Errorf("MsgFlags must be populated with an appropriate security level")
+	}
+
+	if sp.PrivacyProtocol > NoPriv {
+		if sp.PrivacyPassphrase == "" {
+			return fmt.Errorf("SecurityParameters.PrivacyPassphrase is required when a privacy protocol is specified.")
+		}
+	}
+
+	if sp.AuthenticationProtocol > NoAuth {
+		if sp.AuthenticationPassphrase == "" {
+			return fmt.Errorf("SecurityParameters.AuthenticationPassphrase is required when an authentication protocol is specified.")
+		}
 	}
 
 	return nil
@@ -182,30 +193,22 @@ func castUsmSecParams(secParams SnmpV3SecurityParameters) (*UsmSecurityParameter
 	return s, nil
 }
 
-// MD5 HMAC key calculation algorithm
-func md5HMAC(password string, engineID string) []byte {
-	comp := md5.New()
-	var pi int // password index
-	for i := 0; i < 1048576; i += 64 {
-		var chunk []byte
-		for e := 0; e < 64; e++ {
-			chunk = append(chunk, password[pi%len(password)])
-			pi++
-		}
-		comp.Write(chunk)
-	}
-	compressed := comp.Sum(nil)
-	local := md5.New()
-	local.Write(compressed)
-	local.Write([]byte(engineID))
-	local.Write(compressed)
-	final := local.Sum(nil)
-	return final
-}
+var (
+	passwordKeyHashCache = make(map[string][]byte)
+	passwordKeyHashMutex sync.RWMutex
+)
 
-// SHA HMAC key calculation algorithm
-func shaHMAC(password string, engineID string) []byte {
-	hash := sha1.New()
+// Common passwordToKey algorithm, "caches" the result to avoid extra computation each reuse
+func cachedPasswordToKey(hash hash.Hash, hashType string, password string) []byte {
+	cacheKey := hashType + ":" + password
+
+	passwordKeyHashMutex.RLock()
+	value := passwordKeyHashCache[cacheKey]
+	passwordKeyHashMutex.RUnlock()
+
+	if value != nil {
+		return value
+	}
 	var pi int // password index
 	for i := 0; i < 1048576; i += 64 {
 		var chunk []byte
@@ -216,6 +219,34 @@ func shaHMAC(password string, engineID string) []byte {
 		hash.Write(chunk)
 	}
 	hashed := hash.Sum(nil)
+
+	passwordKeyHashMutex.Lock()
+	passwordKeyHashCache[cacheKey] = hashed
+	passwordKeyHashMutex.Unlock()
+
+	return hashed
+}
+
+// MD5 HMAC key calculation algorithm
+func md5HMAC(password string, engineID string) []byte {
+	var compressed []byte
+
+	compressed = cachedPasswordToKey(md5.New(), "MD5", password)
+
+	local := md5.New()
+	local.Write(compressed)
+	local.Write([]byte(engineID))
+	local.Write(compressed)
+	final := local.Sum(nil)
+	return final
+}
+
+// SHA HMAC key calculation algorithm
+func shaHMAC(password string, engineID string) []byte {
+	var hashed []byte
+
+	hashed = cachedPasswordToKey(sha1.New(), "SHA1", password)
+
 	local := sha1.New()
 	local.Write(hashed)
 	local.Write([]byte(engineID))
@@ -226,12 +257,14 @@ func shaHMAC(password string, engineID string) []byte {
 
 func genlocalkey(authProtocol SnmpV3AuthProtocol, passphrase string, engineID string) []byte {
 	var secretKey []byte
+
 	switch authProtocol {
 	default:
 		secretKey = md5HMAC(passphrase, engineID)
 	case SHA:
 		secretKey = shaHMAC(passphrase, engineID)
 	}
+
 	return secretKey
 }
 
@@ -374,13 +407,10 @@ func (sp *UsmSecurityParameters) isAuthentic(packetBytes []byte, packet *SnmpPac
 		return false, err
 	}
 	// TODO: investigate call chain to determine if this is really the best spot for this
-	var secretKey = genlocalkey(sp.AuthenticationProtocol,
-		sp.AuthenticationPassphrase,
-		sp.AuthoritativeEngineID)
 
 	var extkey [64]byte
 
-	copy(extkey[:], secretKey)
+	copy(extkey[:], sp.secretKey)
 
 	var k1, k2 [64]byte
 
@@ -583,8 +613,20 @@ func (sp *UsmSecurityParameters) unmarshal(flags SnmpV3MsgFlags, packet []byte, 
 	}
 	cursor += count
 	if AuthoritativeEngineID, ok := rawMsgAuthoritativeEngineID.(string); ok {
-		sp.AuthoritativeEngineID = AuthoritativeEngineID
-		sp.Logger.Printf("Parsed authoritativeEngineID %s", AuthoritativeEngineID)
+		if sp.AuthoritativeEngineID != AuthoritativeEngineID {
+			sp.AuthoritativeEngineID = AuthoritativeEngineID
+			sp.Logger.Printf("Parsed authoritativeEngineID %s", AuthoritativeEngineID)
+			if sp.AuthenticationProtocol > NoAuth {
+				sp.secretKey = genlocalkey(sp.AuthenticationProtocol,
+					sp.AuthenticationPassphrase,
+					sp.AuthoritativeEngineID)
+			}
+			if sp.PrivacyProtocol > NoPriv {
+				sp.privacyKey = genlocalkey(sp.AuthenticationProtocol,
+					sp.PrivacyPassphrase,
+					sp.AuthoritativeEngineID)
+			}
+		}
 	}
 
 	rawMsgAuthoritativeEngineBoots, count, err := parseRawField(packet[cursor:], "msgAuthoritativeEngineBoots")
