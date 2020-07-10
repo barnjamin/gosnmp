@@ -107,7 +107,7 @@ type GoSNMP struct {
 	requestID uint32
 	random    *rand.Rand
 
-	rxBuf *[rxBufSize]byte // has to be pointer due to https://github.com/golang/go/issues/11728
+	rxBuf [rxBufSize]byte
 
 	// MsgFlags is an SNMPV3 MsgFlags
 	MsgFlags SnmpV3MsgFlags
@@ -273,7 +273,7 @@ func (x *GoSNMP) connect(networkSuffix string) error {
 	// should be reworded?
 	x.requestID = uint32(x.random.Int31() / 2)
 
-	x.rxBuf = new([rxBufSize]byte)
+	x.rxBuf = [rxBufSize]byte{}
 
 	return nil
 }
